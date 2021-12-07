@@ -18,8 +18,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"os"
+	"path"
 	"runtime"
+	"strings"
+	"time"
 
 	"github.com/j-keck/arping"
 	"github.com/vishvananda/netlink"
@@ -33,18 +38,29 @@ import (
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
+
+	"github.com/alexflint/go-filemutex"
 )
+
+const defaultDataDir = "/run/cni/macvlan"
 
 type NetConf struct {
 	types.NetConf
-	Master string `json:"master"`
-	Mode   string `json:"mode"`
-	MTU    int    `json:"mtu"`
-	Mac    string `json:"mac,omitempty"`
+	DataDir  string `json:"dataDir,omitempty"`
+	Master   string `json:"master"`
+	Mode     string `json:"mode"`
+	MTU      int    `json:"mtu"`
+	Mac      string `json:"mac,omitempty"`
+	MacStart string `json:"macStart,omitempty"`
 
 	RuntimeConfig struct {
 		Mac string `json:"mac,omitempty"`
 	} `json:"runtimeConfig,omitempty"`
+}
+
+type macAllocation struct {
+	Last      string            `json:"last,omitempty"`
+	Allocated map[string]string `json:"allocated,omitempty"`
 }
 
 // MacEnvArgs represents CNI_ARG
@@ -84,6 +100,11 @@ func loadConf(bytes []byte, envArgs string) (*NetConf, string, error) {
 	if err := json.Unmarshal(bytes, n); err != nil {
 		return nil, "", fmt.Errorf("failed to load netconf: %v", err)
 	}
+
+	if n.DataDir == "" {
+		n.DataDir = defaultDataDir
+	}
+
 	if n.Master == "" {
 		defaultRouteInterface, err := getDefaultRouteInterfaceName()
 		if err != nil {
@@ -158,6 +179,64 @@ func modeToString(mode netlink.MacvlanMode) (string, error) {
 	}
 }
 
+func lockMacAllocation(statePath string) (*filemutex.FileMutex, error) {
+
+	if _, err := os.Stat(statePath); os.IsNotExist(err) {
+		if err = os.MkdirAll(statePath, 0600); err != nil {
+			return nil, fmt.Errorf("failed to create backup directory: %v", err)
+		} else {
+			f, _ := os.OpenFile(path.Join(statePath, "allocated.json"), os.O_RDONLY|os.O_CREATE, 0600)
+			f.Close()
+		}
+	}
+
+	lock, err := filemutex.New(path.Join(statePath, "allocated.json"))
+	if err != nil {
+		return nil, err
+	}
+	// can sleep up to 3 mins
+	for i := 0; i < 3600; i++ {
+		if err = lock.TryLock(); err == nil {
+			return lock, nil
+		}
+		time.Sleep(time.Millisecond * 50)
+	}
+	return nil, fmt.Errorf("falied to acquire lock: %s", err.Error())
+}
+
+func saveMacAllocation(statePath string, newMacAllocation macAllocation) error {
+
+	data, err := json.MarshalIndent(newMacAllocation, "", " ")
+	if err != nil {
+		return fmt.Errorf("failed to marshall data: %v", err)
+	}
+	if err = ioutil.WriteFile(path.Join(statePath, "allocated.json"), data, 0600); err != nil {
+		return fmt.Errorf("failed to save file allocated.json: %v", err)
+	}
+
+	return nil
+}
+
+func loadMacAllocation(statePath string) (macAllocation, error) {
+	result := macAllocation{}
+	filePath := path.Join(statePath, "allocated.json")
+
+	file, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return result, fmt.Errorf("failed to open file %q: %v", filePath, err)
+	}
+
+	if len(file) == 0 {
+		return result, nil
+	}
+
+	if err = json.Unmarshal([]byte(file), &result); err != nil {
+		return result, fmt.Errorf("failed to unmarshal file %q: %v", filePath, err)
+	}
+
+	return result, nil
+}
+
 func createMacvlan(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interface, error) {
 	macvlan := &current.Interface{}
 
@@ -227,10 +306,67 @@ func createMacvlan(conf *NetConf, ifName string, netns ns.NetNS) (*current.Inter
 	return macvlan, nil
 }
 
+func hwAddrIncrement(addr net.HardwareAddr) net.HardwareAddr {
+
+	for i := len(addr) - 1; i >= 0; i-- {
+		if addr[i] != 255 {
+			addr[i]++
+			break
+		} else {
+			addr[i] = 0
+		}
+	}
+
+	return addr
+}
+
 func cmdAdd(args *skel.CmdArgs) error {
 	n, cniVersion, err := loadConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
+	}
+
+	if n.MacStart != "" {
+		lock, err := lockMacAllocation(n.DataDir)
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+
+		ma, err := loadMacAllocation(n.DataDir)
+		if err != nil {
+			return err
+		}
+
+		macToUse := ""
+		if ma.Last == "" {
+			macToUse = n.MacStart
+			ma.Last = macToUse
+			ma.Allocated = map[string]string{}
+		} else {
+			for k, v := range ma.Allocated {
+				if v == "" {
+					macToUse = k
+					break
+				}
+			}
+			if macToUse == "" {
+				addr, err := net.ParseMAC(ma.Last)
+				if err != nil {
+					return fmt.Errorf("invalid args %v for MAC addr: %v", ma.Last, err)
+				}
+				macToUse = hwAddrIncrement(addr).String()
+				ma.Last = macToUse
+			}
+		}
+		id := strings.TrimSpace(args.ContainerID) + "_" + strings.TrimSpace(args.IfName)
+		ma.Allocated[macToUse] = id
+		n.Mac = macToUse
+
+		err = saveMacAllocation(n.DataDir, ma)
+		if err != nil {
+			return err
+		}
 	}
 
 	isLayer3 := n.IPAM.Type != ""
@@ -341,6 +477,34 @@ func cmdDel(args *skel.CmdArgs) error {
 	n, _, err := loadConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
+	}
+
+	if n.MacStart != "" {
+		lock, err := lockMacAllocation(n.DataDir)
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+
+		ma, err := loadMacAllocation(n.DataDir)
+		if err != nil {
+			return err
+		}
+
+		if ma.Last != "" {
+			id := strings.TrimSpace(args.ContainerID) + "_" + strings.TrimSpace(args.IfName)
+			for k, v := range ma.Allocated {
+				if v == id {
+					ma.Allocated[k] = ""
+					break
+				}
+			}
+		}
+
+		err = saveMacAllocation(n.DataDir, ma)
+		if err != nil {
+			return err
+		}
 	}
 
 	isLayer3 := n.IPAM.Type != ""
